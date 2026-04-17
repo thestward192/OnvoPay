@@ -46,18 +46,29 @@ const OnvoCheckout: React.FC<CheckoutProps> = ({ monto, reservaId }) => {
 
       const data = await response.json();
 
-      // Verificar si el campo 'id' es el identificador del intent de pago
-      if (!response.ok || !data.id) {
+      const checkoutUrl = String(
+        data?.checkoutUrl ?? data?.checkout_url ?? data?.checkout?.url ?? data?.url ?? ''
+      );
+      const checkoutSessionId = String(
+        data?.checkoutSessionId ?? data?.checkout_session_id ?? data?.sessionId ?? data?.session_id ?? ''
+      );
+      const paymentIntentId = String(data?.paymentIntentId ?? data?.payment_intent_id ?? data?.id ?? '');
+
+      if (!response.ok) {
         console.error("Respuesta de la Edge Function:", data);
-        throw new Error("La Edge Function no devolvió un intent de pago válido.");
+        throw new Error("La Edge Function devolvió un error al crear el pago.");
       }
 
-      console.log("Intent de pago creado:", data.id);
+      const destino = checkoutUrl || (checkoutSessionId ? `https://checkout.onvopay.com/pay/${checkoutSessionId}` : '');
 
-      // Generar la URL de prueba con solo los parámetros esenciales
-      const checkoutUrl = `https://checkout.onvopay.com/pay/${data.id}?reservaId=${encodeURIComponent(reservaId)}&monto=${encodeURIComponent(monto)}`;
-      console.log("Redirigiendo al checkout de prueba de OnvoPay con parámetros esenciales:", checkoutUrl);
-      window.location.href = checkoutUrl;
+      if (!destino) {
+        console.error("No se encontró checkout_url ni checkout_session_id en la respuesta:", data);
+        throw new Error("Onvo no devolvió una sesión de checkout válida.");
+      }
+
+      console.log("Intent de pago creado:", paymentIntentId);
+      console.log("Redirigiendo al checkout de OnvoPay:", destino);
+      window.location.href = destino;
     } catch (error) {
       console.error("Error al manejar el pago:", error);
       alert("No se pudo completar el proceso de pago.");

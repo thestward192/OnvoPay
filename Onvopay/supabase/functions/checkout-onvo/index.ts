@@ -17,6 +17,24 @@ const jsonResponse = (payload: unknown, status = 200) =>
     status,
   });
 
+const safeJsonParse = (raw: string) => {
+  try {
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return { raw };
+  }
+};
+
+const getFirstString = (values: Array<unknown>) => {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return value;
+    }
+  }
+
+  return '';
+};
+
 const getSupabaseConfig = () => {
   const url = Deno.env.get('SUPABASE_URL');
   const key = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? Deno.env.get('SUPABASE_ANON_KEY');
@@ -85,6 +103,40 @@ const actualizarReserva = async (id: string, data: Record<string, unknown>) => {
   }
 };
 
+const guardarPago = async (payload: {
+  reserva_id: string;
+  nombre_cliente: string;
+  monto: number;
+  moneda: string;
+  estado_pago: string;
+  onvo_payment_intent_id?: string | null;
+  onvo_checkout_session_id?: string | null;
+  checkout_url?: string | null;
+  metadata?: Record<string, unknown>;
+}) => {
+  const { url, key } = getSupabaseConfig();
+
+  const response = await fetch(`${url}/rest/v1/pagos`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${key}`,
+      apikey: key,
+      'Content-Type': 'application/json',
+      Prefer: 'return=representation',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    console.error('No se pudo guardar el pago:', error);
+    return null;
+  }
+
+  const rows = (await response.json()) as Array<{ id: string }>;
+  return rows[0]?.id || null;
+};
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
@@ -114,62 +166,228 @@ Deno.serve(async (req) => {
       );
     }
 
-    console.log('Datos enviados a OnvoPay:', {
-      amount: monto,
-      currency: moneda,
-      description: `Pago reserva #${reservaGuardadaId}`,
-      metadata: {
-        reservaId: reservaGuardadaId,
-        monto,
-        moneda,
-        clienteNombre,
+    const onvoHeaders = {
+      Authorization: `Bearer ${onvoSecretKey}`,
+      'Content-Type': 'application/json',
+    };
+
+    const description = `Pago reserva #${reservaGuardadaId}`;
+    const metadata = {
+      reservaId: reservaGuardadaId,
+      reservaOrigenId: reservaId,
+      clienteNombre,
+    };
+
+    const checkoutSessionEndpoint = 'https://api.onvopay.com/v1/checkout/sessions/one-time-link';
+    const checkoutLineItemDescription = `Reserva ${reservaId}`;
+    const redirectUrl = typeof body?.redirectUrl === 'string' ? body.redirectUrl : null;
+    const cancelUrl = typeof body?.cancelUrl === 'string' ? body.cancelUrl : null;
+
+    const checkoutSessionPayloads = [
+      {
+        customerName: clienteNombre,
+        redirectUrl,
+        cancelUrl,
+        lineItems: [
+          {
+            description: checkoutLineItemDescription,
+            unitAmount: monto,
+            currency: moneda,
+            quantity: 1,
+          },
+        ],
+        metadata,
       },
-    });
+      {
+        customerName: clienteNombre,
+        redirectUrl,
+        cancelUrl,
+        lineItems: [
+          {
+            description: checkoutLineItemDescription,
+            unitAmount: monto,
+            currency: moneda,
+            quantity: 1,
+          },
+        ],
+        metadata,
+      },
+      {
+        customerName: clienteNombre,
+        redirectUrl,
+        cancelUrl,
+        lineItems: [
+          {
+            description: checkoutLineItemDescription,
+            amountTotal: monto,
+            currency: moneda,
+            quantity: 1,
+          },
+        ],
+        metadata,
+      },
+    ];
 
-    console.log('Respuesta completa de OnvoPay:', raw);
+    let checkoutSessionResponse: Record<string, unknown> | null = null;
+    const sessionErrors: Array<Record<string, unknown>> = [];
 
-    const onvoResponse = await fetch('https://api.onvopay.com/v1/payment-intents', {
+    for (const payload of checkoutSessionPayloads) {
+      const sessionResp = await fetch(checkoutSessionEndpoint, {
+        method: 'POST',
+        headers: onvoHeaders,
+        body: JSON.stringify(payload),
+      });
+
+      const sessionRaw = await sessionResp.text();
+      const sessionData = safeJsonParse(sessionRaw) as Record<string, unknown>;
+
+      if (sessionResp.ok) {
+        checkoutSessionResponse = sessionData;
+        break;
+      }
+
+      sessionErrors.push({
+        endpoint: checkoutSessionEndpoint,
+        payload,
+        status: sessionResp.status,
+        response: sessionData,
+      });
+    }
+
+    if (checkoutSessionResponse) {
+      const checkoutUrl = getFirstString([
+        checkoutSessionResponse.checkout_url,
+        checkoutSessionResponse.checkoutUrl,
+        checkoutSessionResponse.url,
+        (checkoutSessionResponse.checkout as { url?: unknown } | undefined)?.url,
+      ]);
+
+      const checkoutSessionId = getFirstString([
+        checkoutSessionResponse.id,
+        checkoutSessionResponse.checkout_session_id,
+        checkoutSessionResponse.checkoutSessionId,
+        checkoutSessionResponse.session_id,
+        checkoutSessionResponse.sessionId,
+      ]);
+
+      const paymentIntentId = getFirstString([
+        checkoutSessionResponse.payment_intent_id,
+        checkoutSessionResponse.paymentIntentId,
+        checkoutSessionResponse.payment_intent,
+      ]);
+
+      const finalCheckoutUrl = checkoutUrl || (checkoutSessionId ? `https://checkout.onvopay.com/pay/${checkoutSessionId}` : '');
+
+      if (finalCheckoutUrl) {
+        await actualizarReserva(reservaGuardadaId, {
+          onvo_payment_intent_id: paymentIntentId || null,
+          estado: 'pendiente',
+        });
+
+        // Guardar el pago en la tabla pagos
+        await guardarPago({
+          reserva_id: reservaGuardadaId,
+          nombre_cliente: clienteNombre,
+          monto,
+          moneda,
+          estado_pago: 'pendiente',
+          onvo_payment_intent_id: paymentIntentId || null,
+          onvo_checkout_session_id: checkoutSessionId || null,
+          checkout_url: finalCheckoutUrl,
+          metadata: {
+            lineItems: checkoutSessionResponse.lineItems,
+            provider: 'checkout-session',
+          },
+        });
+
+        return jsonResponse(
+          {
+            reservaId: reservaGuardadaId,
+            checkoutUrl: finalCheckoutUrl,
+            checkoutSessionId,
+            paymentIntentId,
+            provider: 'checkout-session',
+            onvoRaw: checkoutSessionResponse,
+          },
+          200
+        );
+      }
+    }
+
+    const intentResp = await fetch('https://api.onvopay.com/v1/payment-intents', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${onvoSecretKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: onvoHeaders,
       body: JSON.stringify({
         amount: monto,
         currency: moneda,
-        description: `Pago reserva #${reservaGuardadaId}`,
-        metadata: {
-          reservaId: reservaGuardadaId,
-          monto,
-          moneda,
-          clienteNombre,
-        },
+        description,
+        metadata,
       }),
     });
 
-    const raw = await onvoResponse.text();
-    console.log('Respuesta de OnvoPay:', raw);
+    const intentRaw = await intentResp.text();
+    const intentData = safeJsonParse(intentRaw) as Record<string, unknown>;
 
-    const onvoData = raw ? JSON.parse(raw) : {};
-
-    if (!onvoResponse.ok || !onvoData?.id) {
-      console.error('Error al generar el intent de pago en OnvoPay:', onvoData);
+    if (!intentResp.ok) {
       await actualizarReserva(reservaGuardadaId, { estado: 'fallido' });
+
+      // Guardar el pago fallido en la tabla pagos
+      await guardarPago({
+        reserva_id: reservaGuardadaId,
+        nombre_cliente: clienteNombre,
+        monto,
+        moneda,
+        estado_pago: 'fallido',
+        metadata: {
+          error: 'No se pudo crear payment intent en Onvo',
+          sessionErrors,
+          intentError: intentData,
+        },
+      });
+
       return jsonResponse(
-        { error: 'Error al generar el intent de pago en OnvoPay', details: onvoData },
-        onvoResponse.status || 500
+        {
+          error: 'No se pudo crear checkout session ni payment intent en Onvo.',
+          checkoutSessionErrors: sessionErrors,
+          paymentIntentError: intentData,
+        },
+        intentResp.status
       );
     }
 
-    // Verificar si OnvoPay devuelve un enlace de checkout
-    const checkoutUrl = onvoData?.checkout_url || `https://checkout.onvopay.com/pay/${onvoData.id}`;
+    const checkoutUrlFromIntent = getFirstString([
+      intentData.checkout_url,
+      intentData.checkoutUrl,
+      intentData.url,
+      (intentData.checkout as { url?: unknown } | undefined)?.url,
+    ]);
+
+    const checkoutSessionIdFromIntent = getFirstString([
+      intentData.checkout_session_id,
+      intentData.checkoutSessionId,
+      intentData.session_id,
+      intentData.sessionId,
+    ]);
+
+    const paymentIntentId = getFirstString([intentData.id, intentData.payment_intent_id, intentData.paymentIntentId]);
 
     await actualizarReserva(reservaGuardadaId, {
-      onvo_payment_intent_id: onvoData.id,
+      onvo_payment_intent_id: paymentIntentId || null,
       estado: 'pendiente',
     });
 
-    return jsonResponse({ paymentIntentId: onvoData.id, reservaId: reservaGuardadaId, checkoutUrl }, 200);
+    return jsonResponse(
+      {
+        ...intentData,
+        reservaId: reservaGuardadaId,
+        checkoutUrl: checkoutUrlFromIntent,
+        checkoutSessionId: checkoutSessionIdFromIntent,
+        paymentIntentId,
+        provider: 'payment-intent-fallback',
+        checkoutSessionErrors: sessionErrors,
+      },
+      200
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
 
@@ -179,78 +397,5 @@ Deno.serve(async (req) => {
 
     console.error('Error en la Edge Function:', message);
     return jsonResponse({ error: message }, 400);
-  }
-});
-
-Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: corsHeaders });
-  }
-
-  try {
-    const body = await req.json();
-    const intentId = body?.intent_id;
-    const status = body?.status;
-
-    if (!intentId || !status) {
-      return jsonResponse({ error: 'Missing intent_id or status' }, 400);
-    }
-
-    const { url, key } = getSupabaseConfig();
-
-    // Fetch the reservation linked to the intent_id
-    const reservaResponse = await fetch(`${url}/rest/v1/reservas?onvo_payment_intent_id=eq.${intentId}`, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        apikey: key,
-      },
-    });
-
-    if (!reservaResponse.ok) {
-      const error = await reservaResponse.text();
-      throw new Error(`Error fetching reservation: ${error}`);
-    }
-
-    const reservas = await reservaResponse.json();
-    const reserva = reservas[0];
-
-    if (!reserva) {
-      return jsonResponse({ error: 'Reservation not found' }, 404);
-    }
-
-    // Update reservation status
-    const updateResponse = await fetch(`${url}/rest/v1/reservas?id=eq.${reserva.id}`, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${key}`,
-        apikey: key,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ estado: status === 'succeeded' ? 'pagado' : 'fallido' }),
-    });
-
-    if (!updateResponse.ok) {
-      const error = await updateResponse.text();
-      throw new Error(`Error updating reservation: ${error}`);
-    }
-
-    // If payment succeeded, update prueba_reservas
-    if (status === 'succeeded') {
-      await fetch(`${url}/rest/v1/prueba_reservas?id=eq.${reserva.id}`, {
-        method: 'PATCH',
-        headers: {
-          Authorization: `Bearer ${key}`,
-          apikey: key,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ estado: 'alquilado' }),
-      });
-    }
-
-    return jsonResponse({ message: 'Reservation updated successfully' }, 200);
-  } catch (error) {
-    console.error('Error in notification handler:', error);
-    return jsonResponse({ error: error.message }, 500);
   }
 });
