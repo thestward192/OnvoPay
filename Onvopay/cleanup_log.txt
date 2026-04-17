@@ -1,0 +1,6 @@
+Cleanup Log:
+- Removed unused CSS files.
+- Removed redundant components.
+- Simplified project structure to focus on OnvoPay integration.
+- Updated README to reflect changes.
+- Verified remaining files for functionality.
